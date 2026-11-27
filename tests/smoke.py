@@ -73,6 +73,18 @@ with TemporaryDirectory() as work:
     assert result["cvi"]["s_cvi_ave"] is None
     assert result["cvi"]["s_cvi_ua"] is None
 
+    figure_dir = work / "jamovi figures"
+    config["analyses"][0]["options"]["bar"] = True
+    config["analyses"][0]["options"]["barCounts"] = True
+    spec.write_text(json.dumps(config), encoding="utf-8")
+    with_plots = json.loads(run("bash", SCRIPTS / "jamovi-cli", csv, spec, "--figures", figure_dir))
+    assert with_plots["analyses"][0]["tables"] == desc["tables"]
+    figures = with_plots["analyses"][0]["figures"]
+    arm_plot = next(plot for plot in figures if plot["path"][-2:] == ['"arm"', "bar"])
+    assert arm_plot["status"] == "ok", arm_plot
+    image = figure_dir / arm_plot["file"]
+    assert image.read_bytes().startswith(b"\x89PNG\r\n\x1a\n")
+
     complete = work / "complete.csv"
     complete.write_text("expert,A,B,arm\n001,3,4,Control\n002,4,2,Program\n", encoding="utf-8")
     result = analyze(complete, {"columns": config["columns"], "cvi": config["cvi"]})
@@ -122,4 +134,41 @@ with TemporaryDirectory() as work:
         )
         assert repeated.returncode != 0
 
-print("Synthetic jamovi, CVI, and Word smoke checks passed.")
+    illustrated = {
+        "kind": "statistics", "subject": "Synthetic study",
+        "scope": ["Only the supplied evidence."],
+        "summary_tables": [{"caption": "Records reviewed", "columns": ["Type", "Count"],
+                            "rows": [["Total", "5"]]}],
+        "objectives": [{
+            "title": "RQ1. Describe the study arms",
+            "tables": [{"caption": "Responses by arm", "columns": ["Arm", "Count"],
+                        "rows": [["Control", "2"], ["Program", "3"]],
+                        "notes": ["Counts are based on five nonmissing arm assignments."]}],
+            "figures": [{"file": image.relative_to(work).as_posix(), "caption": "Responses by arm",
+                         "alt_text": "Two control and three program assignments."}],
+            "interpretation": ["Table II and Fig. 1 show that three of the five records were from the program arm."],
+        }],
+        "recommendation": ["Review draft before sign-off."],
+    }
+    content = work / "illustrated.json"
+    content.write_text(json.dumps(illustrated), encoding="utf-8")
+    report = work / "illustrated.docx"
+    run(sys.executable, SCRIPTS / "report.py", content, report)
+    doc = Document(report)
+    paragraphs = [p.text for p in doc.paragraphs]
+    assert len(doc.inline_shapes) == 1 and doc.tables[1].cell(2, 1).text == "3"
+    assert "Table I. Records reviewed" in paragraphs and "Table II. Responses by arm" in paragraphs
+    assert "Counts are based on five nonmissing arm assignments." in paragraphs
+    assert paragraphs.index("Fig. 1. Responses by arm") < paragraphs.index(
+        illustrated["objectives"][0]["interpretation"][0]
+    )
+    assert doc.inline_shapes[0]._inline.docPr.get("descr") == "Two control and three program assignments."
+    illustrated["objectives"][0]["figures"][0]["file"] = str(image)
+    content.write_text(json.dumps(illustrated), encoding="utf-8")
+    unsafe_output = work / "rejected.docx"
+    failed = subprocess.run(
+        [sys.executable, SCRIPTS / "report.py", content, unsafe_output], check=False, capture_output=True
+    )
+    assert failed.returncode != 0 and not unsafe_output.exists()
+
+print("Synthetic jamovi, CVI, figures, and Word smoke checks passed.")

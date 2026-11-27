@@ -9,6 +9,13 @@ from pathlib import Path
 
 from docx import Document
 from docx.enum.table import WD_CELL_VERTICAL_ALIGNMENT, WD_TABLE_ALIGNMENT
+from docx.enum.text import WD_ALIGN_PARAGRAPH
+from docx.image.exceptions import (
+    InvalidImageStreamError,
+    UnexpectedEndOfFileError,
+    UnrecognizedImageError,
+)
+from docx.image.image import Image
 from docx.oxml import OxmlElement
 from docx.shared import Inches
 
@@ -32,45 +39,83 @@ def lines(value, label):
         not isinstance(line, str) or not line.strip() for line in value
     ):
         raise ValueError(f"{label} must contain one or more nonempty strings")
-    return value
+
+
+def validate_tables(tables, field, required=False):
+    if not isinstance(tables, list) or (required and not tables):
+        raise ValueError(f"{field} must be a list of tables" + (" and cannot be empty" if required else ""))
+    for table in tables:
+        if not isinstance(table, dict) or not {"columns", "rows"} <= table.keys() <= {
+            "caption", "columns", "rows", "notes"
+        }:
+            raise ValueError("Each table needs columns and rows, with an optional caption and notes")
+        headers = table["columns"]
+        lines(headers, "columns")
+        if not 2 <= len(headers) <= 6:
+            raise ValueError("Use two to six columns per table")
+        if "caption" in table:
+            lines([table["caption"]], "caption")
+        if "notes" in table:
+            lines(table["notes"], "notes")
+        if not isinstance(table["rows"], list) or not table["rows"]:
+            raise ValueError("Each table needs at least one row")
+        for row in table["rows"]:
+            if not isinstance(row, list) or len(row) != len(headers) or not all(
+                isinstance(cell, str) for cell in row
+            ):
+                raise ValueError("Each row must have one text cell per column")
 
 
 def validate(spec):
-    required = {"kind", "subject", "scope", "findings", "recommendation"}
-    allowed = required | {"summary_tables", "follow_up_tables"}
-    if not isinstance(spec, dict) or required - spec.keys() or spec.keys() - allowed:
-        raise ValueError("Expected kind, subject, scope, findings, and recommendation")
+    required = {"kind", "subject", "scope", "recommendation"}
+    allowed = required | {"summary_tables", "follow_up_tables", "findings", "objectives"}
+    if not isinstance(spec, dict) or not required <= spec.keys() <= allowed:
+        raise ValueError("Expected kind, subject, scope, recommendation, and findings or objectives")
     if not isinstance(spec["kind"], str) or spec["kind"] not in LAYOUTS:
         raise ValueError("kind must be 'questionnaire' or 'statistics'")
     lines([spec["subject"]], "subject")
     for field in ("scope", "recommendation"):
         lines(spec[field], field)
-    for field in ("summary_tables", "findings", "follow_up_tables"):
-        tables = spec.get(field, [])
-        if not isinstance(tables, list) or (field == "findings" and not tables):
-            raise ValueError(f"{field} must be a list of tables; findings must not be empty")
-        for table in tables:
-            if not isinstance(table, dict) or not {"columns", "rows"} <= table.keys() <= {
-                "caption", "columns", "rows"
-            }:
-                raise ValueError("Each table needs columns and rows, with an optional caption")
-            headers = lines(table["columns"], "columns")
-            if not 2 <= len(headers) <= 6:
-                raise ValueError("Use two to six columns per table")
-            if "caption" in table:
-                lines([table["caption"]], "caption")
-            if not isinstance(table["rows"], list) or not table["rows"]:
-                raise ValueError("Each table needs at least one row")
-            for row in table["rows"]:
-                if not isinstance(row, list) or len(row) != len(headers) or not all(
-                    isinstance(cell, str) for cell in row
-                ):
-                    raise ValueError("Each row must have one text cell per column")
+    for field in ("summary_tables", "follow_up_tables"):
+        validate_tables(spec.get(field, []), field)
+    if "objectives" not in spec:
+        validate_tables(spec.get("findings", []), "findings", required=True)
+        return
+    if spec["kind"] != "statistics" or "findings" in spec:
+        raise ValueError("Use objectives in statistical reports instead of findings")
+    if not isinstance(spec["objectives"], list) or not spec["objectives"]:
+        raise ValueError("objectives must be a nonempty list")
+    for objective in spec["objectives"]:
+        if not isinstance(objective, dict) or not {
+            "title", "tables", "interpretation"
+        } <= objective.keys() <= {"title", "tables", "figures", "interpretation"}:
+            raise ValueError("Each objective needs a title, tables, and interpretation")
+        lines([objective["title"]], "objective title")
+        lines(objective["interpretation"], "interpretation")
+        validate_tables(objective["tables"], "objective tables", required=True)
+        figures = objective.get("figures", [])
+        if not isinstance(figures, list):
+            raise TypeError("figures must be a list")
+        for figure in figures:
+            if not isinstance(figure, dict) or figure.keys() != {"file", "caption", "alt_text"}:
+                raise ValueError("Each figure needs a file, caption, and alt_text")
+            for key in figure:
+                lines([figure[key]], f"figure {key}")
 
 
-def add_table(document, table):
-    if "caption" in table:
-        document.add_paragraph(table["caption"], style="Caption")
+def roman(number):
+    result = []
+    for value, symbol in ((1000, "M"), (900, "CM"), (500, "D"), (400, "CD"), (100, "C"),
+                          (90, "XC"), (50, "L"), (40, "XL"), (10, "X"), (9, "IX"),
+                          (5, "V"), (4, "IV"), (1, "I")):
+        copies, number = divmod(number, value)
+        result.append(symbol * copies)
+    return "".join(result)
+
+
+def add_table(document, table, number):
+    caption = document.add_paragraph(f"Table {roman(number)}. {table.get('caption', 'Results')}", style="Caption")
+    caption.paragraph_format.keep_with_next = True
     headers = table["columns"]
     result = document.add_table(rows=0, cols=len(headers), style="Table Grid")
     result.alignment = WD_TABLE_ALIGNMENT.CENTER
@@ -92,9 +137,32 @@ def add_table(document, table):
             paragraph = cell.paragraphs[0]
             paragraph.style = "Report Table Text"
             paragraph.add_run(value).bold = index == 0
+    for note in table.get("notes", []):
+        document.add_paragraph(note, style="Report Table Text")
 
 
-def generate(spec):
+def add_figure(document, figure, number, content_dir):
+    relative = Path(figure["file"])
+    source = (content_dir / relative).resolve()
+    if relative.is_absolute() or content_dir not in source.parents or source.suffix.lower() != ".png":
+        raise ValueError("Figure file must be a relative PNG path below the report-content directory")
+    try:
+        image = Image.from_file(str(source))
+        if image.content_type != "image/png" or not image.width or not image.height:
+            raise ValueError(f"Expected a valid PNG figure: {relative}")
+        width = min(Inches(6.5), Inches(5.5) * image.width / image.height)
+        paragraph = document.add_paragraph()
+        paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        paragraph.paragraph_format.keep_with_next = True
+        shape = paragraph.add_run().add_picture(BytesIO(image.blob), width=int(width))
+        shape._inline.docPr.set("descr", figure["alt_text"])
+    except (InvalidImageStreamError, UnexpectedEndOfFileError, UnrecognizedImageError, ZeroDivisionError):
+        raise ValueError(f"Expected a valid PNG figure: {relative}") from None
+    caption = document.add_paragraph(f"Fig. {number}. {figure['caption']}", style="Caption")
+    caption.paragraph_format.keep_with_next = False
+
+
+def generate(spec, content_dir):
     validate(spec)
     document = Document(TEMPLATE)
     title, scope, findings, recommendation = LAYOUTS[spec["kind"]]
@@ -111,9 +179,13 @@ def generate(spec):
             run._r.insert(0, deepcopy(template.runs[0]._r.rPr))
         return block
 
-    def tables(field):
-        for table in spec.get(field, []):
-            add_table(document, table)
+    table_number, figure_number = 0, 0
+
+    def tables(items):
+        nonlocal table_number
+        for table in items:
+            table_number += 1
+            add_table(document, table, table_number)
 
     paragraph(title, "Title")
     paragraph(spec["subject"], "Subtitle")
@@ -121,11 +193,19 @@ def generate(spec):
     paragraph("Draft for review.")
     for value in spec["scope"]:
         paragraph(value)
-    tables("summary_tables")
+    tables(spec.get("summary_tables", []))
     paragraph(findings, "Heading")
-    tables("findings")
+    tables(spec.get("findings", []))
+    for objective in spec.get("objectives", []):
+        document.add_paragraph(objective["title"], style="Heading 2")
+        tables(objective["tables"])
+        for figure in objective.get("figures", []):
+            figure_number += 1
+            add_figure(document, figure, figure_number, content_dir)
+        for value in objective["interpretation"]:
+            paragraph(value)
     paragraph(recommendation, "Heading")
-    tables("follow_up_tables")
+    tables(spec.get("follow_up_tables", []))
     for value in spec["recommendation"]:
         paragraph(value)
     block = paragraph(f"Prepared by {CREDIT}", "Credit")
@@ -148,10 +228,10 @@ def main():
     try:
         spec = json.loads(args.content.read_text(encoding="utf-8"))
         output = BytesIO()
-        generate(spec).save(output)
+        generate(spec, args.content.resolve().parent).save(output)
         with args.report.open("xb") as stream:
             stream.write(output.getbuffer())
-    except (ValueError, OSError, KeyError) as error:
+    except (ValueError, TypeError, OSError, KeyError) as error:
         sys.exit(str(error))
 
 
