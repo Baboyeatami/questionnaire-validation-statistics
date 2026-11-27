@@ -8,13 +8,13 @@
 
 ```sh
 bash "$skill/scripts/jamovi-cli" --version
-bash "$skill/scripts/jamovi-cli" study.csv analysis-plan.json > results.json
+bash "$skill/scripts/jamovi-cli" study.csv analysis-plan.json --figures figures > results.json
 # On Windows without Bash, use this equivalent invocation in PowerShell:
-# Rscript --vanilla "$skill/scripts/analyze.R" study.csv analysis-plan.json > results.json
+# Rscript --vanilla "$skill/scripts/analyze.R" study.csv analysis-plan.json --figures figures > results.json
 python3 "$skill/scripts/report.py" report-content.json report.docx
 ```
 
-In the commands, `$skill` is the absolute path to the directory with `SKILL.md`. Run in a fresh output directory so shell redirection cannot replace a prior `results.json`. The Word renderer refuses to overwrite an existing file. The skill computes locally, but reading data into an agent conversation is subject to the host's configured provider and data handling.
+In the commands, `$skill` is the absolute path to the directory with `SKILL.md`. Run in a fresh output directory so shell redirection cannot replace a prior `results.json`. `--figures` is optional, and its argument must be a new directory. The Word renderer refuses to overwrite an existing file. The skill computes locally, but reading data into an agent conversation is subject to the host's configured provider and data handling.
 
 ## Analysis plan and data
 
@@ -35,7 +35,8 @@ CSV input requires UTF-8, comma delimiters, and a header row. XLSX uses the firs
     {"id": "pilot-reliability", "method": "reliability",
      "options": {"vars": ["item_a", "item_b"], "revItems": ["item_b"], "itemRestCor": true}},
     {"id": "RQ1-descriptives", "method": "descriptives",
-     "options": {"vars": ["scale_mean"], "splitBy": ["group"], "n": true, "missing": true}},
+     "options": {"vars": ["scale_mean"], "splitBy": ["group"], "n": true, "missing": true,
+                 "hist": true}},
     {"id": "RQ2-group-comparison", "method": "ttestIS",
      "options": {"vars": ["scale_mean"], "group": "group", "students": false,
                  "welchs": true, "desc": true, "meanDiff": true, "ci": true, "effectSize": true}}
@@ -46,7 +47,12 @@ CSV input requires UTF-8, comma delimiters, and a header row. XLSX uses the firs
 - Required: `columns` maps original column names to types. Types are `continuous`, `nominal`, `ordinal`, and `text`. Set `levels` in the intended order for ordinal values and for nominal groups where order matters. Only `continuous` columns accept numeric `range` bounds. Treat numerical Likert item codes as `continuous` only where the scoring or selected method requires the numerical representation; document that use.
 - Omit `scores`, `analyses`, and `cvi` for an audit. Results include counts of valid, missing, and invalid entries for each declared column. Invalid entries block requested computations; resolve the values and rerun. Undeclared columns are unavailable to jamovi. A score is derived in memory; mean scoring may allow partial item response under a documented rule, and sum scoring requires all items. Reversal is `minimum + maximum - response`. For reliability use the original item names and select `revItems` separately; the runner uses complete cases across those items.
 - Supported `jmv` methods: `descriptives`, `reliability`, `ttestOneS`, `ttestIS`, `ttestPS`, `anovaOneW`, `anovaNP`, `anovaRM`, `anovaRMNP`, `ancova`, `mancova`, `corrMatrix`, `contTables`, `contTablesPaired`, `propTest2`, `propTestN`, `linReg`, `logRegBin`, `logRegMulti`, `logRegOrd`, `pca`, `efa`, and `cfa`. Look up exact options in the [`jmv` reference manual](https://cran.r-project.org/web/packages/jmv/refman/jmv.html). For a paired t-test, use `"options": {"pairs": [{"i1": "pre", "i2": "post"}], "desc": true, "meanDiff": true, "ci": true, "effectSize": true}`. Match each row to one observation unit (e.g. one respondent, with time points in separate columns for paired tests). `data` and `formula` are not accepted analysis options; use the structured variable fields.
-- The JSON contains visible jamovi result tables, not plots or `.omv` output. `status: "error"` and `status: "blocked"` are recorded per analysis and for CVI; structured output can be valid even when an analysis failed. A `null` value is unavailable, not zero. The runner does not select models, tests, contrast direction, missingness rules, or suitable thresholds on the user's behalf.
+- The JSON contains visible jamovi result tables. When `--figures` is used, each successful analysis also contains a `figures` array with paths within the jamovi result tree and, for each PNG saved, its `file` name relative to the export directory. A failed plot has `status: "error"` and a reason instead of a file. Figures are saved only for visible plot results, so select the relevant jamovi plot options in the analysis plan.
+- `status: "error"` and `status: "blocked"` are recorded per analysis and for CVI; structured output can be valid even when an analysis failed. A `null` value is unavailable, not zero. The runner does not select models, tests, contrast direction, missingness rules, or suitable thresholds on the user's behalf.
+
+### Plotting ordered responses
+
+For a single Likert item, declare it as `ordinal` with the actual response codes in order, such as `"levels": ["1", "2", "3", "4"]`, and use `descriptives` with `"options": {"vars": ["Q1"], "freq": true, "bar": true, "barCounts": true}` to export both counts and a count plot. Compare the plot with the frequency table; the plot may omit levels with zero responses. Include the response anchors, any unused levels, the valid denominator and any missing responses in the report. If the objective also explicitly requires arithmetic on the same codes, use a separate numeric analysis plan so the measurement choice is documented and the distribution stays categorical. For continuous outcomes or aggregate scales, choose plots appropriate to the distribution or comparison, and state what any error bars show.
 
 ### CVI using a separate expert ratings file
 
@@ -82,4 +88,34 @@ The skill computes these indices by explicit counts alongside jamovi results. I-
 }
 ```
 
-Use `kind: "statistics"` for a statistical report. All table cells are strings. Tables accept two to six columns, an optional caption, and at least one body row. Optional `summary_tables` and `follow_up_tables` use the same structure. Use readable tables rather than reproducing the full raw jamovi output. Keep identifiers out of the report and retain draft status until human review.
+For a statistical report, use `kind: "statistics"` and replace `findings` with `objectives`. For example, with the exported plot from a synthetic Likert item:
+
+```json
+{
+  "kind": "statistics",
+  "subject": "Synthetic Workshop Feedback Survey",
+  "scope": ["Three (3) valid responses to Q1 were analyzed."],
+  "objectives": [{
+    "title": "RQ1. Describe responses to the clarity item",
+    "tables": [{
+      "caption": "Response distribution for Q1",
+      "columns": ["Response", "Count"],
+      "rows": [["Strongly disagree", "0"], ["Disagree", "1"], ["Agree", "2"], ["Strongly agree", "0"]],
+      "notes": ["Denominator: 3 valid responses. Missing: 0."]
+    }],
+    "figures": [{
+      "file": "figures/analysis-1-figure-1.png",
+      "caption": "Counts for Q1. Codes 1–4 correspond to the order shown in Table I.",
+      "alt_text": "One response was recorded for disagree and two for agree."
+    }],
+    "interpretation": [
+      "As shown in Table I and Fig. 1, two (2) of the three (3) respondents agreed with the clarity statement. This result describes the supplied responses."
+    ]
+  }],
+  "recommendation": ["Report the denominator alongside the distribution."]
+}
+```
+
+- Tables accept two to six columns, at least one body row, an optional `caption`, and optional `notes` (an array of strings). All table cells are strings. `summary_tables` and `follow_up_tables` use the same format. Older statistical JSON with `findings` still renders.
+- For figures, take the actual filename from a successful jamovi result. Provide the PNG path relative to the report JSON directory, plus a caption and descriptive alt text. Do not add numbering to captions yourself: the renderer numbers tables (`Table I.`, `Table II.`) in document order, including summary tables, and figures (`Fig. 1.`, `Fig. 2.`) separately. Each objective displays its tables, figures, and then its interpretation.
+- Use readable tables rather than copying all raw jamovi output. Preserve verified results through the prose edit, keep identifiers out of the report, and retain draft status until human review.

@@ -191,30 +191,59 @@ jmv_option <- function(value) {
     lapply(value, jmv_option)
 }
 
-tables_from <- function(element, path = character()) {
+visible_output <- function(element, path = character()) {
     if (!isTRUE(element$visible)) return(list())
+    if (inherits(element, "Image")) return(list(list(path = path, element = element)))
     if (identical(element$status, "error"))
         fail(paste(element$title, paste(unlist(element$state), collapse = " ")))
-    if (inherits(element, "Table")) {
-        values <- element$asDF
-        if (!nrow(values)) return(list())
-        rownames(values) <- NULL
-        return(list(list(path = as.list(path), title = element$title,
-                         columns = as.list(names(values)), rows = values,
-                         notes = lapply(element$notes, function(note) note$note),
-                         footnotes = as.list(element$footnotes))))
-    }
+    if (inherits(element, "Table")) return(list(list(path = path, element = element)))
     if (!inherits(element, c("Group", "Array"))) return(list())
-    tables <- list()
+    output <- list()
     for (index in seq_along(element$itemNames)) {
         child <- if (inherits(element, "Array")) element$get(index = index) else
             element$get(element$itemNames[index])
-        tables <- c(tables, tables_from(child, c(path, element$itemNames[index])))
+        output <- c(output, visible_output(child, c(path, element$itemNames[index])))
     }
-    tables
+    output
 }
 
-analyze <- function(request, data) {
+export_tables <- function(output) {
+    tables <- lapply(output, function(item) {
+        element <- item$element
+        if (!inherits(element, "Table")) return(NULL)
+        values <- element$asDF
+        if (!nrow(values)) return(NULL)
+        rownames(values) <- NULL
+        list(path = as.list(item$path), title = element$title,
+             columns = as.list(names(values)), rows = values,
+             notes = lapply(element$notes, function(note) note$note),
+             footnotes = as.list(element$footnotes))
+    })
+    Filter(Negate(is.null), tables)
+}
+
+export_figures <- function(output, directory, analysis_index) {
+    images <- Filter(function(item) inherits(item$element, "Image"), output)
+    lapply(seq_along(images), function(index) {
+        item <- images[[index]]
+        image <- item$element
+        name <- sprintf("analysis-%d-figure-%d.png", analysis_index, index)
+        target <- file.path(directory, name)
+        temp <- tempfile(tmpdir = directory, fileext = ".png")
+        on.exit(unlink(temp))
+        details <- tryCatch({
+            if (identical(image$status, "error"))
+                fail(paste(unlist(image$state), collapse = " "))
+            image$saveAs(temp)
+            if (!isTRUE(file.info(temp)$size > 8L) || !file.rename(temp, target))
+                fail("jamovi did not write a PNG")
+            list(status = "ok", file = name)
+        }, error = function(error) list(status = "error", reason = conditionMessage(error)))
+        c(list(path = as.list(item$path), title = image$title), details)
+    })
+}
+
+analyze <- function(request, data, figure_dir, analysis_index) {
     methods <- c("descriptives", "reliability", "ttestOneS", "ttestIS", "ttestPS",
                  "anovaOneW", "anovaNP", "anovaRM", "anovaRMNP", "ancova", "mancova",
                  "corrMatrix", "contTables", "contTablesPaired", "propTest2", "propTestN",
@@ -237,15 +266,19 @@ analyze <- function(request, data) {
             fail("Reliability requires at least three complete rows and variation in every item")
     }
     warnings <- character()
-    tables <- withCallingHandlers({
-        result <- do.call(fun, c(list(data = data), lapply(options, jmv_option)))
-        tables_from(result)
+    result <- withCallingHandlers({
+        output <- visible_output(do.call(fun, c(list(data = data), lapply(options, jmv_option))))
+        tables <- export_tables(output)
+        if (!length(tables)) fail(paste("jamovi returned no visible tables:", request$id))
+        result <- list(status = "ok", complete_cases = n, tables = tables)
+        if (!is.null(figure_dir)) result$figures <- export_figures(output, figure_dir, analysis_index)
+        result
     }, warning = function(warning) {
         warnings <<- c(warnings, conditionMessage(warning))
         invokeRestart("muffleWarning")
     })
-    if (!length(tables)) fail(paste("jamovi returned no visible tables:", request$id))
-    list(status = "ok", complete_cases = n, tables = tables, warnings = as.list(unique(warnings)))
+    result$warnings <- as.list(unique(warnings))
+    result
 }
 
 main <- function(args) {
@@ -253,7 +286,9 @@ main <- function(args) {
     require_package("jmv")
     engine <- list(runtime = R.version.string, jmv = as.character(utils::packageVersion("jmv")))
     if (identical(args, "--version")) return(engine)
-    if (length(args) != 2L) fail("Usage: jamovi-cli DATASET PLAN.json (or --version)")
+    export <- length(args) == 4L && identical(args[3], "--figures") && nzchar(args[4])
+    if (length(args) != 2L && !export)
+        fail("Usage: jamovi-cli DATASET PLAN.json [--figures NEW_DIRECTORY] (or --version)")
     plan <- jsonlite::read_json(args[2])
     object(plan, c("columns", "analyses", "scores", "cvi", "sheet"), "plan", "columns")
     if (!length(plan$columns)) fail("Declare at least one dataset column in the plan")
@@ -271,11 +306,16 @@ main <- function(args) {
         text(request$id, "analysis ID")
     }, "")
     if (anyDuplicated(ids)) fail("Analysis IDs must be unique")
+    figure_dir <- if (export) args[4]
+    if (export && !dir.create(figure_dir, showWarnings = FALSE))
+        fail("Figure directory must be new and its parent must already exist and be writable")
     attempt <- function(expr) tryCatch(expr, error = function(e)
         list(status = "error", reason = conditionMessage(e)))
-    analyses <- lapply(plan$analyses, function(request)
+    analyses <- lapply(seq_along(plan$analyses), function(index) {
+        request <- plan$analyses[[index]]
         c(list(id = request$id, method = request$method),
-          if (invalid) blocked else attempt(analyze(request, prepared$data))))
+          if (invalid) blocked else attempt(analyze(request, prepared$data, figure_dir, index)))
+    })
     cvi <- if (!is.null(plan$cvi)) {
         if (invalid) blocked else attempt(content_validity(plan$cvi, prepared$data[names(plan$columns)]))
     }
