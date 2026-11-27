@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+scripts="$(cd -- "$(dirname -- "$0")" && pwd)"
+app="${JAMOVI_APP:-/Applications/jamovi.app}/Contents"
+r="$app/Frameworks/R.framework/Versions/Current/Resources"
+
+if [[ -z "${RSCRIPT:-}" && -x "$r/bin/exec/R" && -d "$app/Resources/modules/jmv/R" ]]; then
+    export R_HOME="$r"
+    export R_LIBS="$app/Resources/modules/jmv/R:$app/Resources/modules/base/R"
+    export DYLD_FALLBACK_LIBRARY_PATH="$r/lib${DYLD_FALLBACK_LIBRARY_PATH:+:$DYLD_FALLBACK_LIBRARY_PATH}"
+    exec "$r/bin/exec/R" --vanilla --slave -f "$scripts/analyze.R" --args "$@"
+fi
+
+if ! command -v "${RSCRIPT:-Rscript}" >/dev/null; then
+    echo "Install jamovi Desktop on macOS or install R with the jmv and jsonlite packages." >&2
+    exit 1
+fi
+exec "${RSCRIPT:-Rscript}" --vanilla "$scripts/analyze.R" "$@"
