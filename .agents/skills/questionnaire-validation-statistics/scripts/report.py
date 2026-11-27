@@ -150,7 +150,7 @@ def add_figure(document, figure, number, content_dir):
         image = Image.from_file(str(source))
         if image.content_type != "image/png" or not image.width or not image.height:
             raise ValueError(f"Expected a valid PNG figure: {relative}")
-        width = min(Inches(6.5), Inches(5.5) * image.width / image.height)
+        width = min(Inches(6.5), Inches(3.8) * image.width / image.height)
         paragraph = document.add_paragraph()
         paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
         paragraph.paragraph_format.keep_with_next = True
